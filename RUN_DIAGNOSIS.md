@@ -400,3 +400,101 @@ flutter create --platforms=android --org com.daoge --project-name paohelp C:\tem
 
 - `assets/models/` 下仍无 `.tflite` 模型，App 会走模拟检测分支（不影响启动与演示）。
 
+---
+
+## 八、真机运行时缺陷修复：相机预览黑屏（2026-09-24 17:1x）
+
+### 8.1 现场现象
+
+真机反馈：点击「开始实物识别」后，相机预览正常显示约 **2 秒**，随后**预览区变黑**，
+但顶部工具栏仍然可见（"只显示了部分菜单"）——即崩溃没有发生，只是预览那一块变成了空白/黑块。
+
+### 8.2 根因（插件源码 + 引擎源码双重证据）
+
+完整链条：
+
+1. 原 `didChangeAppLifecycleState` 在 `AppLifecycleState.inactive` 时执行 `_cameraController?.dispose()`。
+2. **`inactive` 在 Android 上并不等于"进入后台"**。引擎源码
+   `engine/src/flutter/lib/ui/platform_dispatcher.dart:2378` 明确写着：该状态对应 host view 的
+   **窗口焦点变化**（`Activity.onWindowFocusChanged`），**应用可能仍处于可见状态**。
+   因此系统弹窗、权限提示、国产 ROM 的悬浮提醒、下拉通知栏等**任何一次瞬时失焦**都会触发它。
+3. `CameraController.dispose()`（`camera-0.11.4/lib/src/camera_controller.dart:910`）只置
+   `_isDisposed = true`，**不会把 `value` 重置成 uninitialized** → `value.isInitialized` 仍为 `true`。
+4. 于是 `CameraPreview`（`camera-0.11.4/lib/src/camera_preview.dart:24`）仍旧走
+   `controller.buildPreview()`，而 `buildPreview()`（`camera_controller.dart:681`）第一步就是
+   `_throwIfNotInitialized('buildPreview')`，该方法在 `_isDisposed` 时**抛
+   `CameraException('Disposed CameraController')`** —— 注意这是 `throw` 而非 `assert`，
+   **release 包同样会抛**。
+5. 异常在其所属 element 的 build 阶段被捕获 → 该子树被 `ErrorWidget` 顶替 →
+   **预览区变成空白/黑块，工具栏与 HUD 不受影响**。这正是"黑屏但菜单还在"。
+6. 为什么是**永久**黑屏：`resumed` 后重新初始化时，旧实例的异步 `dispose()` 尚未走完，
+   `initialize()` 极易因摄像头被占而失败；失败后走 `_startSimulatedStream()` 降级，
+   但它**没有清空 `_cameraController`**，而 `build` 的判断顺序是
+   **先看 `_cameraController != null`、后看 `_isSimulatedMode`**，于是继续用已释放的实例构造
+   `CameraPreview`，此后每一次重建都抛一次异常 → 永不恢复。
+
+### 8.3 修复（重写 `lib/ui/camera_scanner_screen.dart`）
+
+核心是建立并守住一条不变量：**`_cameraController` 非 null ⟹ 它一定尚未被 dispose**。
+
+| 改动 | 说明 |
+|---|---|
+| 收敛唯一释放入口 | 新增 `_releaseCamera()`，**先置空引用再 await dispose**，销毁期间 build 绝不会拿到死实例 |
+| `inactive` 不再销毁相机 | 只登记 `_needsCameraRestart`，回前台时重建一次作自愈，彻底避开瞬时失焦这条路径 |
+| 只有真正后台才释放 | `paused` / `hidden` / `detached` 才调用 `_releaseCamera()` |
+| 初始化防重入 | `_isInitializing` 互斥；`initialize()` 返回后若已离开页面或已退后台，直接销毁该实例 |
+| 降级路径不留脏引用 | 失败降级先走 `_releaseCamera()`；`build` 也优先判断 `_isSimulatedMode` |
+| 帧流失败单独降级 | 不再因为帧流启动失败而丢掉本来可用的预览 |
+| 定时器泄漏修复 | `_startSimulatedStream()` 每次先 `cancel()` 旧定时器（4.3 的另一条） |
+| 可见诊断条 | 相机异常时在顶部显示原因 + 「重试」按钮（`_cameraNotice`），便于现场定位 |
+| `_switchCamera` 走统一入口 | 不再在 dispose 后残留引用 |
+
+### 8.4 本轮验证的边界（重要）
+
+- `dart format --output=none lib/ tool/ test/` → **21 个文件全部解析通过**，语法无误。
+- `tool/engine_smoke.dart` 回归 → **67 PASS / 0 FAIL**（引擎层未改动，确认无副作用）。
+- **未能执行 `flutter analyze`，也未能重新构建 APK**：第二节的阻塞 A 在 17:16 之后复发且持续（见 8.5）。
+  所以本次修改**尚未通过编译期验证，也还没有对应的新 APK**。
+- 已逐一对照插件/引擎源码确认所用 API 确实存在（`isStreamingImages`、`startImageStream`、
+  `stopImageStream`、`supportsImageStreaming`，以及 `AppLifecycleState` 的 5 个成员）。
+- Dart 3 的 `switch` 语句已不需要 `break`（本文件依赖该语义），已用最小样例实测确认合法。
+
+### 8.5 阻塞 A 复发（与第二节同一故障）
+
+| 时间 | 状态 |
+|---|---|
+| ~16:0x | 故障活跃 |
+| 16:26 ~ 16:42 | **自动恢复**，期间构建成功 |
+| 17:16 ~ 17:5x | **复发且持续**：连续 8+ 次构建尝试，每次 3 秒即失败在同一个 spawn |
+
+本轮新证据：
+
+- 命名管道总数仅 **437**，无实例耗尽 → 排除"管道泄漏压垮系统"。
+- `fltmc filters` 里 `ahflt`（微软电脑管家幽灵驱动）**已消失**，说明上一轮锁定的它不是主因；
+  当前活跃的第三方内核组件是 **火绒 `sysdiag`（8 个实例）**，用户态 `HipsTray.exe` 与
+  `MSPCManagerService` 同时在跑。
+- 失败点始终是"由 `dart:io` 发起的子进程创建"，与被调用的程序无关——已观测到
+  `cmd.exe`、`git.exe`、`dart.exe language-server`、`gradlew.bat` 全部失败。
+
+处置建议（按成本从低到高）：
+
+1. **在自己的普通终端里执行同一命令**（绕开本工具的进程沙箱）：
+
+   ```powershell
+   cd C:\project\pao-help
+   & "C:\src\flutter\bin\flutter.bat" build apk --release
+   ```
+
+   能成功 → 拦截来自工具的沙箱层；同样报 231 → 确认在系统层。
+2. 暂停火绒防护并退出微软电脑管家后重试。
+3. 重启一次机器（上一轮就是由此恢复的）。
+
+工具链不可用时可复用的诊断旁路：
+
+- `dart format --output=none --set-exit-if-changed <路径>`：**在进程内解析**，无需 spawn，
+  可在 spawn 全面失效时做语法校验。
+- `dart.exe <脚本>`：只要脚本自身不起子进程就能跑；`tool/engine_smoke.dart` 正是靠这点
+  在故障期间仍可回归。
+- 曾尝试让 Python 以 LSP 协议直接驱动 `dart language-server`（Python 的匿名管道不受影响）：
+  服务能启动、`initialize` 握手成功，但等待诊断时进程被环境终止——**这条旁路在本机不可用**。
+
