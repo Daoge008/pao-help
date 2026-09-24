@@ -1,0 +1,37 @@
+# ---- OS / 编辑器 ----
+.DS_Store
+Thumbs.db
+*.iml
+.idea/
+
+# ---- Flutter / Dart 生成物 ----
+.dart_tool/
+.packages
+.pub/
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+
+# ---- Android ----
+android/.gradle
+android/captures/
+android/.cxx/
+android/gradlew
+android/gradlew.bat
+android/local.properties
+android/GeneratedPluginRegistrant.java
+key.properties
+**/*.jks
+**/*.keystore
+
+# ---- 本项目只做 Android，暂未使用的平台目录 ----
+ios/
+windows/
+macos/
+linux/
+web/
+
+# ---- 本地产物 / 备份 / 工具状态，不入库 ----
+dist/
+.backup/
+.workbuddy/
